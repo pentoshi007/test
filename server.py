@@ -6,6 +6,7 @@ Usage: python3 server.py
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+import socket
 import threading
 import sys
 import time
@@ -15,9 +16,15 @@ lock = threading.Lock()
 last_checkin = 0
 
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle each request in a new thread for responsiveness."""
+class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
+    """Listen on both IPv4 and IPv6 so cloudflared can connect via either."""
     daemon_threads = True
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        # Allow dual-stack (IPv4 + IPv6) on a single socket
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -68,27 +75,24 @@ def input_loop():
 
 
 def status_printer():
-    """Prints a status line if client hasn't checked in recently."""
     global last_checkin
-    shown_waiting = False
+    shown_warning = False
     while True:
         time.sleep(5)
-        if last_checkin == 0 and not shown_waiting:
-            pass  # still waiting for first connect
-        elif last_checkin > 0:
+        if last_checkin > 0:
             elapsed = time.time() - last_checkin
-            if elapsed > 15 and not shown_waiting:
+            if elapsed > 15 and not shown_warning:
                 sys.stdout.write("\r\033[K[!] No check-in for {:.0f}s — client may be offline\nshell> ".format(elapsed))
                 sys.stdout.flush()
-                shown_waiting = True
+                shown_warning = True
             elif elapsed <= 15:
-                shown_waiting = False
+                shown_warning = False
 
 
 if __name__ == "__main__":
     PORT = 4444
-    server = ThreadedHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"[*] Listening on http://127.0.0.1:{PORT}")
+    server = DualStackHTTPServer(("::", PORT), Handler)
+    print(f"[*] Listening on port {PORT} (IPv4 + IPv6)")
     print("[*] Waiting for client to connect...\n")
 
     threading.Thread(target=input_loop, daemon=True).start()

