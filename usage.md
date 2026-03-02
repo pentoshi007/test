@@ -7,172 +7,215 @@
   operator types commands                 executes & streams output back
 ```
 
-- `server.py` runs on your **Mac** and is your operator interface.
-- `pdf2.ps1` runs on the **Windows** target, connects back via Cloudflare Tunnel, and executes commands.
+- `server.py` runs on your **Mac** — your operator terminal.
+- `pdf2.ps1` runs on the **Windows** target, connects back via Cloudflare Tunnel, executes commands, and streams output back.
 
 ---
 
-## Starting Up
+## Starting Up (Order Matters)
 
-**Mac (server):**
+Always start in this order to avoid connection errors:
 
 ```bash
+# 1. Start the Python server first
 python3 server.py
+
+# 2. Start the Cloudflare tunnel (in a separate terminal)
+cloudflared tunnel --config ~/.cloudflared/config.yml run hostel-mac
+
+# 3. Run pdf2.ps1 on the Windows target
 ```
 
-**Windows (client):** Run `pdf2.ps1` with PowerShell. It self-elevates to admin and installs a scheduled task for persistence.
+> **Why order matters:** If the tunnel starts before `server.py`, cloudflared can't reach port 4444 and logs `connection refused`. The Windows client will retry with exponential backoff automatically once the server is up.
 
 ---
 
-## Operator Commands (typed in server.py terminal)
+## Operator Commands
 
-These are built-in commands — they are NOT sent to the remote shell.
+Type these at the `shell>` prompt — they are **not** sent to the remote shell.
 
-| Command           | What it does                                                           |
-| ----------------- | ---------------------------------------------------------------------- |
-| `help`            | Show the list of built-in commands                                     |
-| `status`          | Check if the client is online/offline and whether a command is running |
-| `cancel`          | Abort the currently running remote command                             |
-| `exit`            | Tell the client to shut itself down                                    |
-| _(anything else)_ | Sent as a command to the remote Windows shell                          |
-
----
-
-## Sending Remote Commands
-
-Just type any shell command at the `shell>` prompt and press Enter. It will be sent to the Windows client, executed, and the output streamed back.
-
-```
-shell> whoami
-shell> ipconfig /all
-shell> dir C:\Users
-```
-
-The command header shows the full path and active timeout mode:
-
-```
-PS C:\Windows\system32> whoami [300s]
-```
+| Command           | What it does                                               |
+| ----------------- | ---------------------------------------------------------- |
+| `help`            | Show available built-in commands                           |
+| `status`          | Check if client is online and whether a command is running |
+| `cancel`          | Abort the currently running remote command                 |
+| `exit`            | Tell the Windows client to shut itself down                |
+| _(anything else)_ | Sent as a shell command to the remote Windows machine      |
 
 ---
 
 ## Cancelling a Running Command
 
-Type `cancel` at the `shell>` prompt while a command is executing:
+**Two ways:**
+
+**1. Keyboard shortcut — `Ctrl+X`** _(recommended)_
+Press `Ctrl+X` at any time while a command is running. This is bound to cancel so that `Ctrl+C` (which kills the server) isn't needed.
+
+**2. Type `cancel`**
 
 ```
 shell> cancel
 ```
 
-The server queues a cancel signal. The client picks it up on its next poll cycle (~200ms), stops the command, and sends back:
+The cancel signal is picked up by the client on its next poll (~200ms), stops the command, and replies:
 
 ```
 [!] Command cancelled by operator.
 ```
 
-> **Note:** If no command is running, `cancel` will print `[*] No command is currently running.`
+> **Note:** `Ctrl+C` exits `server.py` entirely — use `Ctrl+X` or type `cancel` to stop just the remote command.
 
 ---
 
 ## Long-Running Commands (No Timeout)
 
-By default commands time out after **300 seconds**. To run a command with no timeout, prefix it with `notimeout:`:
+Default timeout is **300 seconds**. For commands that legitimately run longer, prefix with `notimeout:`:
 
 ```
 shell> notimeout:ping -t google.com
 shell> notimeout:netstat -an
 ```
 
-The header will confirm the mode:
+The header confirms the mode:
 
 ```
 PS C:\> ping -t google.com [no-timeout]
 ```
 
-Use `cancel` to stop a no-timeout command when done.
-
----
-
-## Checking Client Connectivity
-
-```
-shell> status
-```
-
-Output examples:
-
-```
-[*] Client ONLINE (IDLE) — last check-in 1.2s ago
-[*] Client ONLINE (RUNNING command) — last check-in 0.4s ago
-[!] Client may be OFFLINE — last check-in 45s ago
-[*] No client check-in yet.
-```
-
-The server also automatically warns you if there has been no check-in for more than 20 seconds.
+Always use `Ctrl+X` or `cancel` to stop a no-timeout command when done.
 
 ---
 
 ## Viewing Truncated Output (Full Result)
 
-> ⚠️ **Not Available.** There is no built-in command to retrieve the full output of a truncated result.
+Output chunks are capped at **32,000 bytes**. If a command produces more, the chunk is trimmed with `[...truncated]`.
 
-Output chunks are capped at **32,000 bytes** per send. If a command produces more than that in a single streaming interval, the chunk is trimmed with `[...truncated]` appended.
+**Workaround — pipe to a file and read it in parts:**
 
-**Workarounds:**
+```
+# Step 1: redirect output to a file on the target
+shell> some-command > C:\output.txt
 
-- Pipe output to a file on the target and retrieve it in parts:
-  ```
-  shell> some-command > C:\output.txt
-  shell> Get-Content C:\output.txt -TotalCount 100
-  shell> Get-Content C:\output.txt -Tail 100
-  ```
-- Use `Select-Object` or `head`/`tail` equivalents to limit output at the source.
-- For directory listings, filter with `-Filter` or `Where-Object` instead of listing everything.
+# Step 2: read it in chunks
+shell> Get-Content C:\output.txt -TotalCount 100    # first 100 lines
+shell> Get-Content C:\output.txt -Tail 100           # last 100 lines
+shell> Get-Content C:\output.txt | Select-Object -Skip 100 -First 100  # lines 101–200
+```
+
+**Or limit output at the source:**
+
+```
+shell> Get-Process | Select-Object -First 30
+shell> dir C:\ | Where-Object { $_.Name -like "*.txt" }
+```
+
+---
+
+## Checking Client Status
+
+```
+shell> status
+```
+
+Possible outputs:
+
+| Output                                                     | Meaning                                 |
+| ---------------------------------------------------------- | --------------------------------------- |
+| `Client ONLINE (IDLE) — last check-in 1.2s ago`            | Connected, waiting for commands         |
+| `Client ONLINE (RUNNING command) — last check-in 0.4s ago` | Currently executing                     |
+| `Client may be OFFLINE — last check-in 45s ago`            | No recent ping — may have crashed       |
+| `No client check-in yet.`                                  | Client has never connected this session |
+
+The server also auto-warns if there's been no check-in for 20+ seconds.
+
+---
+
+## Sending Remote Commands
+
+Just type any PowerShell command at `shell>`:
+
+```
+shell> whoami
+shell> ipconfig /all
+shell> Get-Process | Sort-Object CPU -Descending | Select-Object -First 10
+```
+
+The command header shows prompt path and timeout mode:
+
+```
+PS C:\Windows\system32> whoami [300s]
+PS C:\> ping -t google.com [no-timeout]
+```
 
 ---
 
 ## Persistence & Crash Recovery
 
-The client installs itself as a Windows Scheduled Task named `SystemManagementUpdate`:
+The client installs itself as a Windows Scheduled Task (`SystemManagementUpdate`):
 
 - **Trigger:** At system startup
-- **Restart on failure:** Up to 3 automatic restarts with a 10-second delay between each
+- **Auto-restart on crash:** Up to 3 restarts, 10-second delay each
 
-If the process crashes mid-session, it will restart automatically (up to 3 times) without requiring a reboot.
+Check it in Task Scheduler → `SystemManagementUpdate` → Settings tab.
 
 ---
 
-## Log File
+## Log File (`shell.txt`)
 
-The client logs activity to `shell.txt` in the same directory as `pdf2.ps1`. Logs rotate automatically when the file exceeds 5 MB (old log saved as `shell.txt.old`).
+Located in the same directory as `pdf2.ps1`. Auto-rotates at 5 MB (old log → `shell.txt.old`).
 
-Log entries include timestamps, levels (`INFO` / `WARN` / `ERROR`), and events like:
+Common log entries:
 
-- Client start / PID
-- Commands received
-- Timeouts and cancellations
-- Connection errors and retry counts
-- Runspace (re)creation
+| Entry                                    | Meaning                                             |
+| ---------------------------------------- | --------------------------------------------------- |
+| `Client started. PID=...`                | Client launched                                     |
+| `CMD: <command>`                         | Command received from server                        |
+| `Created new persistent runspace`        | First command of session (normal)                   |
+| `Connection error #N: (530)`             | Cloudflare tunnel not ready yet — client will retry |
+| `Connection error #N: (502) Bad Gateway` | Server unreachable — check `server.py` is running   |
+| `Command timed out`                      | Command hit 300s limit — use `notimeout:` if needed |
+| `Command cancelled`                      | Operator triggered cancel                           |
+
+---
+
+## Troubleshooting
+
+### "connection refused" in cloudflared logs
+
+`server.py` wasn't running when the tunnel started. Start `server.py` first.
+
+### 530 errors in shell.txt
+
+Cloudflare tunnel wasn't established yet when the client started. The client retries automatically with exponential backoff — no action needed if the tunnel comes up within a minute.
+
+### 400 Bad Request / "Unsolicited response on idle HTTP channel"
+
+This was a known bug — fixed. The server now sends `Connection: close` on every response, preventing cloudflared from trying to reuse connections with HTTP/2 frames on an HTTP/1.1 socket.
+
+### Output streaming feels slow
+
+Output streams adaptively: ~200ms when output is flowing, up to 1s when idle. If everything looks slow, check `status` — the client may be offline.
 
 ---
 
 ## Output Streaming Behaviour
 
-Output is streamed back **adaptively** — not on a fixed timer:
-
-| Condition                    | Flush interval |
-| ---------------------------- | -------------- |
-| Output flowing actively      | ~200 ms        |
-| No output for a few cycles   | ~500 ms        |
-| Idle (no output for a while) | ~1000 ms       |
-
-This means interactive commands feel snappy, while idle commands don't waste bandwidth.
+| Condition                  | Flush interval |
+| -------------------------- | -------------- |
+| Output actively flowing    | ~200 ms        |
+| No output for a few cycles | ~500 ms        |
+| Idle (no output)           | ~1000 ms       |
 
 ---
 
-## Tips
+## Quick Reference
 
-- Always check `status` before sending a command to confirm the client is online.
-- Use `cancel` instead of closing the server — it cleanly stops the remote process.
-- Prefer piping verbose commands to a file on the target and reading it in chunks to avoid output truncation.
-- The `notimeout:` prefix is for commands you know will run long — always `cancel` them when done.
+| Action                 | How                                   |
+| ---------------------- | ------------------------------------- |
+| Cancel running command | `Ctrl+X` or type `cancel`             |
+| Kill the server        | `Ctrl+C`                              |
+| Run with no timeout    | `notimeout:<command>`                 |
+| Check connectivity     | `status`                              |
+| Shut down client       | `exit`                                |
+| View help              | `help`                                |
+| Read long output       | Pipe to file, read with `Get-Content` |

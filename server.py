@@ -13,6 +13,7 @@ import sys
 import time
 import queue
 import readline  # enables arrow-key history in input()
+readline.parse_and_bind(r'"\C-x": "cancel\n"')  # Ctrl+X = cancel (Ctrl+C would kill server)
 
 pending_command = None
 pending_signal = None
@@ -40,12 +41,15 @@ class Handler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
-    def _respond(self, code, body=b"", keep_alive=True):
+    def _respond(self, code, body=b""):
         """Helper to send a response with proper headers."""
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "keep-alive" if keep_alive else "close")
+        # Always close: cloudflared tunnels HTTP/2 internally;
+        # keeping connections alive causes it to send HTTP/2 frames
+        # on what Python sees as an HTTP/1.1 socket → 400 Bad Request.
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -71,7 +75,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"pong")
 
         else:
-            self._respond(404, keep_alive=False)
+            self._respond(404)
 
     def do_POST(self):
         global command_running
@@ -97,7 +101,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, b"ok")
 
         else:
-            self._respond(404, keep_alive=False)
+            self._respond(404)
 
 
 def result_printer():
