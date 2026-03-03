@@ -232,6 +232,24 @@ function Invoke-InteractiveCommand {
     $exe = $parts[0]
     $args = if ($parts.Count -gt 1) { $parts[1] } else { "" }
 
+    # Resolve full path so SYSTEM account finds user-installed binaries
+    try {
+        $resolved = (Get-Command $exe -ErrorAction Stop).Source
+        if ($resolved) { $exe = $resolved }
+    } catch {
+        # Fallback: search common user-install dirs that SYSTEM's PATH may lack
+        $searchDirs = @(
+            "$env:ProgramFiles", "${env:ProgramFiles(x86)}",
+            "$env:SystemRoot\System32",
+            "$env:LOCALAPPDATA\Programs\Python", "$env:LOCALAPPDATA\Programs",
+            "$env:ProgramFiles\Python*", "$env:ProgramFiles\nodejs"
+        )
+        foreach ($dir in $searchDirs) {
+            $candidates = Get-ChildItem -Path $dir -Filter "$exe.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidates) { $exe = $candidates.FullName; break }
+        }
+    }
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
     $psi.Arguments = $args
