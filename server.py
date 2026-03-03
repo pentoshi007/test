@@ -14,6 +14,7 @@ import sys
 import time
 import queue
 import signal
+import os
 import readline  # enables arrow-key history in input()
 
 # Per-client state
@@ -242,7 +243,7 @@ def input_loop():
                 continue
         except (EOFError, KeyboardInterrupt):
             print("\n[*] Exiting.")
-            sys.exit(0)
+            os._exit(0)
 
         stripped = cmd.strip().lower()
 
@@ -373,7 +374,7 @@ def input_loop():
 
         if stripped == "exit":
             print("[*] Shutting down server.")
-            sys.exit(0)
+            os._exit(0)
 
         # --- Remote command or stdin ---
         with lock:
