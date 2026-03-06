@@ -113,6 +113,7 @@ function Update-Self {
         # Download latest version to temp file
         $tempFile = Join-Path $env:TEMP "pdf2_update_$(Get-Random).ps1"
         try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
             $wc = New-Object System.Net.WebClient
             $wc.Headers.Add("User-Agent", "Mozilla/5.0")
             $wc.DownloadFile($updateUrl, $tempFile)
