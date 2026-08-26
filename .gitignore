@@ -4,3 +4,5 @@ __pycache__/
 
 # local ops doc - keep out of the repo
 usage.md
+server.log
+.clai/
