@@ -180,8 +180,8 @@ function Start-Payload {
     try {
         switch ($ext) {
             '.ps1' {
-                Write-Log ('Executing payload in-process: {0}' -f $Path)
-                & $Path
+                Write-Log ('Launching payload detached (hidden): {0}' -f $Path)
+                Start-Process -FilePath 'powershell.exe' -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $Path) -WindowStyle Hidden
             }
             '.exe' {
                 Write-Log ('Starting executable: {0}' -f $Path)
